@@ -108,7 +108,7 @@
 #define STRATUM_LOOP_DELAY_IDLE_MS 20
 #endif
 #ifndef MINER_SHARE_LOG
-#define MINER_SHARE_LOG 1
+#define MINER_SHARE_LOG 0
 #endif
 #ifndef SUGGEST_DIFF_FIXED_VALUE
 #define SUGGEST_DIFF_FIXED_VALUE 16384.0
@@ -126,7 +126,15 @@
 #define SUGGEST_DIFF_SMOOTH_ALPHA_PCT 40
 #endif
 #ifndef MINER_HEARTBEAT_LOG
-#define MINER_HEARTBEAT_LOG 0
+#define MINER_HEARTBEAT_LOG 1
+#endif
+#ifndef ENABLE_VERSION_ROLLING
+#define ENABLE_VERSION_ROLLING 1
+#endif
+#ifndef VERSION_ROLL_INTERVAL_MS
+// How long to keep hashing the same (job, version) pair before rolling the version bits
+// locally to get a fresh nonce search space, instead of waiting for a new mining.notify.
+#define VERSION_ROLL_INTERVAL_MS 45000
 #endif
 
 #ifndef ADAPTIVE_TARGET_MS_DEFAULT
@@ -424,6 +432,7 @@ struct JobData
   uint32_t midstate[8];
   uint32_t bake[16];
   uint32_t hw_midstate[8];
+  uint32_t version_bits; // rolled version bits (BIP 310) baked into this job's header, 0 if unused
 };
 
 struct JobRequest
@@ -441,6 +450,7 @@ struct JobResult
   uint32_t nonce_count;
   double difficulty;
   uint8_t hash[32];
+  uint32_t version_bits; // carried through so the submit path can report the rolled version
 };
 
 #if defined(CONFIG_IDF_TARGET_ESP32)
@@ -510,6 +520,23 @@ static inline uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
+}
+
+// Spreads the low bits of `counter` across the set bits of `mask` (LSB-first), so that
+// counter values 0..(2^popcount(mask)-1) map to distinct subsets of mask. Used to walk the
+// version-rolling space (BIP 310) regardless of whether the pool's mask is contiguous.
+static inline uint32_t distribute_bits_into_mask(uint32_t counter, uint32_t mask)
+{
+  uint32_t result = 0;
+  while (mask != 0 && counter != 0)
+  {
+    uint32_t lowest = mask & (~mask + 1u);
+    if (counter & 0x1u)
+      result |= lowest;
+    mask &= ~lowest;
+    counter >>= 1;
+  }
+  return result;
 }
 
 static inline uint32_t nonce_stride_advance_u32(uint32_t cursor, uint32_t stride, uint32_t nonce_count)
@@ -1255,6 +1282,7 @@ struct I2cMasterJobShared
   uint32_t midstate[8];
   uint32_t bake[16];
   uint32_t generation;
+  uint32_t version_bits;
 };
 
 struct I2cMasterJobSnapshot
@@ -1270,6 +1298,7 @@ struct I2cMasterJobSnapshot
   uint32_t midstate[8];
   uint32_t bake[16];
   uint32_t generation;
+  uint32_t version_bits;
 };
 
 static portMUX_TYPE s_i2c_master_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -1313,7 +1342,8 @@ static void i2c_master_set_active_job(uint32_t full_job_id,
                                       uint8_t total_nonce_lanes,
                                       const uint8_t *blockheader,
                                       const uint32_t *midstate,
-                                      const uint32_t *bake)
+                                      const uint32_t *bake,
+                                      uint32_t version_bits)
 {
   if (blockheader == nullptr || midstate == nullptr || bake == nullptr)
     return;
@@ -1336,6 +1366,7 @@ static void i2c_master_set_active_job(uint32_t full_job_id,
   memcpy(s_i2c_master_job.midstate, midstate, sizeof(s_i2c_master_job.midstate));
   memcpy(s_i2c_master_job.bake, bake, sizeof(s_i2c_master_job.bake));
   s_i2c_master_job.generation = next_generation;
+  s_i2c_master_job.version_bits = version_bits;
   s_i2c_master_hashes_pending = 0;
   taskEXIT_CRITICAL(&s_i2c_master_lock);
 }
@@ -1370,6 +1401,7 @@ static bool i2c_master_read_job_snapshot(I2cMasterJobSnapshot &snapshot)
     memcpy(snapshot.midstate, s_i2c_master_job.midstate, sizeof(snapshot.midstate));
     memcpy(snapshot.bake, s_i2c_master_job.bake, sizeof(snapshot.bake));
     snapshot.generation = s_i2c_master_job.generation;
+    snapshot.version_bits = s_i2c_master_job.version_bits;
   }
   taskEXIT_CRITICAL(&s_i2c_master_lock);
   return active;
@@ -1673,6 +1705,7 @@ void runI2cMasterWorker(void *name)
             result.nonce = item.nonce;
             result.nonce_count = 0;
             result.difficulty = diff_from_target(result.hash);
+            result.version_bits = job.version_bits;
             xQueueSend(s_result_queue, &result, 0);
           }
         }
@@ -1839,6 +1872,11 @@ void runStratumWorker(void *name) {
   #if defined(CONFIG_IDF_TARGET_ESP32)
   uint8_t sha_buffer_swap[128] = {0};
   #endif
+  // Version-rolling (BIP 310 / ASICBoost) local state.
+  uint32_t base_version_le = 0;     // version as given by the pool for the current mJob, header byte order
+  uint32_t version_roll_counter = 0;
+  uint32_t current_version_bits = 0;
+  uint32_t last_version_roll_ms = millis();
   static StaticJsonDocument<BUFFER_JSON_DOC> stratum_doc;
   static char stratum_line_buffer[kStratumLineBufferSize];
   static size_t stratum_line_len = 0;
@@ -1857,6 +1895,143 @@ void runStratumWorker(void *name) {
     return (strcmp(mJob.job_id, incoming.job_id) == 0) &&
            (strcmp(mJob.ntime, incoming.ntime) == 0) &&
            (strcmp(mJob.prev_block_hash, incoming.prev_block_hash) == 0);
+  };
+
+  // Builds midstate/bake/hw_midstate from mMiner.bytearray_blockheader (optionally with a
+  // rolled version applied), then (re)seeds nonce ranges and feeds SW/HW/I2C job queues.
+  // Shared by both a real mining.notify and a local version-roll refresh, since both need to
+  // do the exact same header->job_data->queue pipeline, only differing in *why* it's called.
+  auto applyVersionAndFeedJob = [&](uint32_t version_bits_to_apply)
+  {
+    job_pool++;
+    s_working_current_job_id = job_pool & 0xFF;
+
+    uint32_t rolled_version = base_version_le ^ version_bits_to_apply;
+    memcpy(mMiner.bytearray_blockheader, &rolled_version, sizeof(rolled_version));
+
+    memset(mMiner.bytearray_blockheader+80, 0, 128-80);
+    mMiner.bytearray_blockheader[80] = 0x80;
+    mMiner.bytearray_blockheader[126] = 0x02;
+    mMiner.bytearray_blockheader[127] = 0x80;
+
+    nerd_mids(diget_mid, mMiner.bytearray_blockheader);
+    nerd_sha256_bake(diget_mid, mMiner.bytearray_blockheader+64, bake);
+
+    #ifdef HARDWARE_SHA265
+    #if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3)
+      esp_sha_acquire_hardware();
+      sha_hal_hash_block(SHA2_256,  mMiner.bytearray_blockheader, 64/4, true);
+      sha_hal_read_digest(SHA2_256, hw_midstate);
+      esp_sha_release_hardware();
+    #endif
+    #endif
+
+    #if defined(CONFIG_IDF_TARGET_ESP32)
+    for (int i = 0; i < 32; ++i)
+      ((uint32_t*)sha_buffer_swap)[i] = __builtin_bswap32(((const uint32_t*)(mMiner.bytearray_blockheader))[i]);
+    #endif
+
+    uint32_t nonce_seed = 0;
+    #ifdef RANDOM_NONCE
+    nonce_seed = RandomGet() & RANDOM_NONCE_MASK;
+    #else
+      const uint32_t mac_offset = mac_nonce_offset() & 0x0FFFFFFF;
+      #ifdef I2C_HASH_MASTER
+      if (i2c_master_has_workers())
+        nonce_seed = 0x10000000 + mac_offset;
+      else
+      #endif
+        nonce_seed = 0xDA54E700 + mac_offset;  //nonce 0x00000000 is not possible, start from some random nonce
+    #endif
+    nonce_seed += version_roll_counter; // keep rolls from re-searching the same range
+    nonce_pool = nonce_seed;
+    use_partitioned_nonce_ranges = false;
+    current_total_nonce_lanes = local_nonce_lanes;
+    sw_nonce_cursor = nonce_seed;
+    sw_nonce_stride = 1;
+    #ifdef HARDWARE_SHA265
+    hw_nonce_cursor = nonce_seed + 1;
+    hw_nonce_stride = 1;
+    #endif
+    #ifdef I2C_HASH_MASTER
+    uint8_t active_slave_count = i2c_master_worker_count();
+    if (active_slave_count > 0)
+    {
+      uint32_t total_stride = (uint32_t)local_nonce_lanes + (uint32_t)active_slave_count;
+      if (total_stride == 0)
+        total_stride = 1;
+      if (total_stride > 255)
+        total_stride = 255;
+      use_partitioned_nonce_ranges = true;
+      current_total_nonce_lanes = (uint8_t)total_stride;
+      sw_nonce_cursor = nonce_seed;
+      sw_nonce_stride = total_stride;
+      #ifdef HARDWARE_SHA265
+      hw_nonce_cursor = nonce_seed + 1;
+      hw_nonce_stride = total_stride;
+      #endif
+    }
+    #endif
+
+    JobData *job_data = &s_job_data_pool[s_job_data_index++ % kJobDataPoolSize];
+    job_data->id = job_pool;
+    job_data->difficulty = currentPoolDifficulty;
+    job_data->version_bits = version_bits_to_apply;
+    poolTargetFromDifficulty(job_data->difficulty, job_data->pool_target_le);
+    memcpy(job_data->sha_buffer_sw, mMiner.bytearray_blockheader, sizeof(job_data->sha_buffer_sw));
+    #if defined(CONFIG_IDF_TARGET_ESP32)
+    memcpy(job_data->sha_buffer_hw, sha_buffer_swap, sizeof(job_data->sha_buffer_hw));
+    #else
+    memcpy(job_data->sha_buffer_hw, mMiner.bytearray_blockheader, sizeof(job_data->sha_buffer_hw));
+    #endif
+    memcpy(job_data->midstate, diget_mid, sizeof(job_data->midstate));
+    memcpy(job_data->bake, bake, sizeof(job_data->bake));
+    #ifdef HARDWARE_SHA265
+    memcpy(job_data->hw_midstate, hw_midstate, sizeof(job_data->hw_midstate));
+    #else
+    memset(job_data->hw_midstate, 0, sizeof(job_data->hw_midstate));
+    #endif
+    s_current_job_data = job_data;
+
+    const uint32_t sw_nonce_count = calc_nonce_per_job_sw();
+    #ifdef HARDWARE_SHA265
+    const uint32_t hw_nonce_count = calc_nonce_per_job_hw();
+    #endif
+    for (uint32_t i = 0; i < kJobQueueTargetDepth; ++i)
+    {
+      if (use_partitioned_nonce_ranges)
+      {
+        JobPush(s_job_queue_sw, job_data, sw_nonce_cursor, sw_nonce_count, sw_nonce_stride);
+        sw_nonce_cursor = nonce_stride_advance_u32(sw_nonce_cursor, sw_nonce_stride, sw_nonce_count);
+        #ifdef HARDWARE_SHA265
+        JobPush(s_job_queue_hw, job_data, hw_nonce_cursor, hw_nonce_count, hw_nonce_stride);
+        hw_nonce_cursor = nonce_stride_advance_u32(hw_nonce_cursor, hw_nonce_stride, hw_nonce_count);
+        #endif
+      }
+      else
+      {
+        JobPush(s_job_queue_sw, job_data, nonce_pool, sw_nonce_count);
+        nonce_pool += sw_nonce_count;
+        #ifdef HARDWARE_SHA265
+        JobPush(s_job_queue_hw, job_data, nonce_pool, hw_nonce_count);
+        nonce_pool += hw_nonce_count;
+        #endif
+      }
+    }
+    #ifdef I2C_HASH_MASTER
+    i2c_master_set_active_job(job_pool,
+                              currentPoolDifficulty,
+                              nonce_seed,
+                              local_nonce_lanes,
+                              current_total_nonce_lanes,
+                              mMiner.bytearray_blockheader,
+                              diget_mid,
+                              bake,
+                              version_bits_to_apply);
+    #endif
+
+    current_version_bits = version_bits_to_apply;
+    last_version_roll_ms = millis();
   };
 
   while(true) {
@@ -1902,6 +2077,11 @@ void runStratumWorker(void *name) {
     {
       //Stop miner current jobs
       mWorker = init_mining_subscribe();
+
+      // STEP 0: Negotiate version-rolling (BIP 310) before subscribing.
+      #if ENABLE_VERSION_ROLLING
+      tx_mining_configure(client, mWorker);
+      #endif
 
       // STEP 1: Pool server connection (SUBSCRIBE)
       bool resume_attempt = s_resume_subscribe_enabled && s_last_subscribe_session_id.length() > 0;
@@ -2037,8 +2217,6 @@ void runStratumWorker(void *name) {
 
                                           //Increse templates readed
                                           templates++;
-                                          job_pool++;
-                                          s_working_current_job_id = job_pool & 0xFF;
 
                                           last_job_time = millis();
                                           mLastTXtoPool = last_job_time;
@@ -2049,125 +2227,10 @@ void runStratumWorker(void *name) {
 
                                           //Prepare data for new jobs
                                           mMiner=calculateMiningData(mWorker, mJob);
+                                          memcpy(&base_version_le, mMiner.bytearray_blockheader, sizeof(base_version_le));
+                                          version_roll_counter = 0;
 
-                                          memset(mMiner.bytearray_blockheader+80, 0, 128-80);
-                                          mMiner.bytearray_blockheader[80] = 0x80;
-                                          mMiner.bytearray_blockheader[126] = 0x02;
-                                          mMiner.bytearray_blockheader[127] = 0x80;
-
-                                          nerd_mids(diget_mid, mMiner.bytearray_blockheader);
-                                          nerd_sha256_bake(diget_mid, mMiner.bytearray_blockheader+64, bake);
-
-                                          #ifdef HARDWARE_SHA265
-                                          #if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3)
-                                            esp_sha_acquire_hardware();
-                                            sha_hal_hash_block(SHA2_256,  mMiner.bytearray_blockheader, 64/4, true);
-                                            sha_hal_read_digest(SHA2_256, hw_midstate);
-                                            esp_sha_release_hardware();
-                                          #endif
-                                          #endif
-
-                                          #if defined(CONFIG_IDF_TARGET_ESP32)
-                                          for (int i = 0; i < 32; ++i)
-                                            ((uint32_t*)sha_buffer_swap)[i] = __builtin_bswap32(((const uint32_t*)(mMiner.bytearray_blockheader))[i]);
-                                          #endif
-
-                                          uint32_t nonce_seed = 0;
-                                          #ifdef RANDOM_NONCE
-                                          nonce_seed = RandomGet() & RANDOM_NONCE_MASK;
-                                          #else
-                                            const uint32_t mac_offset = mac_nonce_offset() & 0x0FFFFFFF;
-                                            #ifdef I2C_HASH_MASTER
-                                            if (i2c_master_has_workers())
-                                              nonce_seed = 0x10000000 + mac_offset;
-                                            else
-                                            #endif
-                                              nonce_seed = 0xDA54E700 + mac_offset;  //nonce 0x00000000 is not possible, start from some random nonce
-                                          #endif
-                                          nonce_pool = nonce_seed;
-                                          use_partitioned_nonce_ranges = false;
-                                          current_total_nonce_lanes = local_nonce_lanes;
-                                          sw_nonce_cursor = nonce_seed;
-                                          sw_nonce_stride = 1;
-                                          #ifdef HARDWARE_SHA265
-                                          hw_nonce_cursor = nonce_seed + 1;
-                                          hw_nonce_stride = 1;
-                                          #endif
-                                          #ifdef I2C_HASH_MASTER
-                                          uint8_t active_slave_count = i2c_master_worker_count();
-                                          if (active_slave_count > 0)
-                                          {
-                                            uint32_t total_stride = (uint32_t)local_nonce_lanes + (uint32_t)active_slave_count;
-                                            if (total_stride == 0)
-                                              total_stride = 1;
-                                            if (total_stride > 255)
-                                              total_stride = 255;
-                                            use_partitioned_nonce_ranges = true;
-                                            current_total_nonce_lanes = (uint8_t)total_stride;
-                                            sw_nonce_cursor = nonce_seed;
-                                            sw_nonce_stride = total_stride;
-                                            #ifdef HARDWARE_SHA265
-                                            hw_nonce_cursor = nonce_seed + 1;
-                                            hw_nonce_stride = total_stride;
-                                            #endif
-                                          }
-                                          #endif
-                                          
-
-                                          JobData *job_data = &s_job_data_pool[s_job_data_index++ % kJobDataPoolSize];
-                                          job_data->id = job_pool;
-                                          job_data->difficulty = currentPoolDifficulty;
-                                          poolTargetFromDifficulty(job_data->difficulty, job_data->pool_target_le);
-                                          memcpy(job_data->sha_buffer_sw, mMiner.bytearray_blockheader, sizeof(job_data->sha_buffer_sw));
-                                          #if defined(CONFIG_IDF_TARGET_ESP32)
-                                          memcpy(job_data->sha_buffer_hw, sha_buffer_swap, sizeof(job_data->sha_buffer_hw));
-                                          #else
-                                          memcpy(job_data->sha_buffer_hw, mMiner.bytearray_blockheader, sizeof(job_data->sha_buffer_hw));
-                                          #endif
-                                          memcpy(job_data->midstate, diget_mid, sizeof(job_data->midstate));
-                                          memcpy(job_data->bake, bake, sizeof(job_data->bake));
-                                          #ifdef HARDWARE_SHA265
-                                          memcpy(job_data->hw_midstate, hw_midstate, sizeof(job_data->hw_midstate));
-                                          #else
-                                          memset(job_data->hw_midstate, 0, sizeof(job_data->hw_midstate));
-                                          #endif
-                                          s_current_job_data = job_data;
-
-                                          const uint32_t sw_nonce_count = calc_nonce_per_job_sw();
-                                          #ifdef HARDWARE_SHA265
-                                          const uint32_t hw_nonce_count = calc_nonce_per_job_hw();
-                                          #endif
-                                          for (uint32_t i = 0; i < kJobQueueTargetDepth; ++i)
-                                          {
-                                            if (use_partitioned_nonce_ranges)
-                                            {
-                                              JobPush(s_job_queue_sw, job_data, sw_nonce_cursor, sw_nonce_count, sw_nonce_stride);
-                                              sw_nonce_cursor = nonce_stride_advance_u32(sw_nonce_cursor, sw_nonce_stride, sw_nonce_count);
-                                              #ifdef HARDWARE_SHA265
-                                              JobPush(s_job_queue_hw, job_data, hw_nonce_cursor, hw_nonce_count, hw_nonce_stride);
-                                              hw_nonce_cursor = nonce_stride_advance_u32(hw_nonce_cursor, hw_nonce_stride, hw_nonce_count);
-                                              #endif
-                                            }
-                                            else
-                                            {
-                                              JobPush(s_job_queue_sw, job_data, nonce_pool, sw_nonce_count);
-                                              nonce_pool += sw_nonce_count;
-                                              #ifdef HARDWARE_SHA265
-                                              JobPush(s_job_queue_hw, job_data, nonce_pool, hw_nonce_count);
-                                              nonce_pool += hw_nonce_count;
-                                              #endif
-                                            }
-                                          }
-                                          #ifdef I2C_HASH_MASTER
-                                          i2c_master_set_active_job(job_pool,
-                                                                    currentPoolDifficulty,
-                                                                    nonce_seed,
-                                                                    local_nonce_lanes,
-                                                                    current_total_nonce_lanes,
-                                                                    mMiner.bytearray_blockheader,
-                                                                    diget_mid,
-                                                                    bake);
-                                          #endif
+                                          applyVersionAndFeedJob(0); // fresh pool template: start unrolled
                                         } else
                                         {
                                           Serial.println("Parsing error, need restart");
@@ -2214,6 +2277,25 @@ void runStratumWorker(void *name) {
                                       #endif
                                       break;
 
+      }
+    }
+
+    // Local version-roll refresh: once we've been hashing the same (job, version) pair for a
+    // while, roll the version bits (BIP 310) instead of waiting for the pool's next
+    // mining.notify. Same header/coinbase/merkle, different search space - no round trip needed.
+    if (mWorker.version_rolling && mWorker.version_mask != 0 && job_pool != 0xFFFFFFFF)
+    {
+      uint32_t now_ms = millis();
+      if ((uint32_t)(now_ms - last_version_roll_ms) >= VERSION_ROLL_INTERVAL_MS)
+      {
+        version_roll_counter++;
+        uint32_t next_version_bits = distribute_bits_into_mask(version_roll_counter, mWorker.version_mask);
+        resetMiningQueuesOnly();
+        applyVersionAndFeedJob(next_version_bits);
+        #if MINER_SHARE_LOG
+        Serial.printf("[WORKER] Local version-roll #%lu, bits=0x%08lX\n",
+                      (unsigned long)version_roll_counter, (unsigned long)next_version_bits);
+        #endif
       }
     }
 
@@ -2290,7 +2372,7 @@ void runStratumWorker(void *name) {
         if (!client.connected())
           break;
         unsigned long sumbit_id = 0;
-        if (!tx_mining_submit(client, mWorker, mJob, res->nonce, sumbit_id))
+        if (!tx_mining_submit(client, mWorker, mJob, res->nonce, sumbit_id, res->version_bits))
         {
           client.stop();
           isMinerSuscribed = false;
@@ -2364,6 +2446,7 @@ void minerWorkerSw(void * task_id)
     {
       result = {};
       result.difficulty = job.data->difficulty;
+      result.version_bits = job.data->version_bits;
       result.nonce = 0xFFFFFFFF;
       result.id = job.data->id;
       result.nonce_count = job.nonce_count;
@@ -2576,6 +2659,7 @@ void minerWorkerHw(void * task_id)
       result.nonce = 0xFFFFFFFF;
       result.nonce_count = job.nonce_count;
       result.difficulty = job.data->difficulty;
+      result.version_bits = job.data->version_bits;
 
       const uint8_t *sha_buffer = job.data->sha_buffer_hw + 64;
       const uint32_t *hw_midstate = job.data->hw_midstate;
@@ -2812,6 +2896,7 @@ void minerWorkerHw(void * task_id)
       result.nonce = 0xFFFFFFFF;
       result.nonce_count = job.nonce_count;
       result.difficulty = job.data->difficulty;
+      result.version_bits = job.data->version_bits;
       const uint8_t *sha_buffer = job.data->sha_buffer_hw;
       const uint8_t *sha_upper = sha_buffer + 64;
       uint32_t nonce = job.nonce_start;

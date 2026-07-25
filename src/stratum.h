@@ -29,6 +29,8 @@ typedef struct {
     int extranonce2_size;
     char wName[80];
     char wPass[80];
+    bool version_rolling;      // negotiated via mining.configure (BIP 310)
+    uint32_t version_mask;     // rollable version bits granted by the pool
 } mining_subscribe;
 
 typedef struct {
@@ -56,6 +58,9 @@ unsigned long getNextId(unsigned long id);
 bool verifyPayload(String* line);
 bool checkError(const StaticJsonDocument<BUFFER_JSON_DOC> &doc);
 
+//Method Mining.configure (BIP 310 - version-rolling / ASICBoost)
+bool tx_mining_configure(WiFiClient& client, mining_subscribe& mSubscribe);
+
 //Method Mining.subscribe
 mining_subscribe init_mining_subscribe(void);
 bool tx_mining_subscribe(WiFiClient& client, mining_subscribe& mSubscribe, const char *resume_id = nullptr);
@@ -69,7 +74,7 @@ bool parse_mining_notify(String line, mining_job& mJob);
 bool parse_mining_notify_doc(StaticJsonDocument<BUFFER_JSON_DOC>& doc, mining_job& mJob);
 
 //Method Mining.submit
-bool tx_mining_submit(WiFiClient& client, const mining_subscribe& mWorker, const mining_job& mJob, unsigned long nonce, unsigned long &submit_id);
+bool tx_mining_submit(WiFiClient& client, const mining_subscribe& mWorker, const mining_job& mJob, unsigned long nonce, unsigned long &submit_id, uint32_t version_bits = 0);
 
 //Difficulty Methods 
 bool tx_suggest_difficulty(WiFiClient& client, double difficulty);

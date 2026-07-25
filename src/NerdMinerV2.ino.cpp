@@ -47,7 +47,12 @@
 #define MONITOR_TASK_PRIORITY 5
 #endif
 #ifndef LOOP_TASK_PRIORITY
-#define LOOP_TASK_PRIORITY 2
+// Must stay above every task pinned to core 1 (MinerHw-0 prio 4, MinerSw-1 prio 3), otherwise
+// FreeRTOS never schedules loop() while a mining task is ready - which is nearly always once
+// hashing is active - and button1/button2.tick() stops being called, silently breaking the
+// long-press (boot) reset. loop() blocks on vTaskDelay(50ms) each cycle, so raising its
+// priority doesn't cost hashrate: it just preempts briefly on wake and yields right back.
+#define LOOP_TASK_PRIORITY 5
 #endif
 #ifndef LOOP_WIFI_PROCESS_CONNECTED_MS
 #define LOOP_WIFI_PROCESS_CONNECTED_MS 1000

@@ -17,6 +17,9 @@
 #ifndef STRATUM_SUBSCRIBE_POLL_MS
 #define STRATUM_SUBSCRIBE_POLL_MS 20
 #endif
+#ifndef STRATUM_CONFIGURE_TIMEOUT_MS
+#define STRATUM_CONFIGURE_TIMEOUT_MS 3000
+#endif
 #ifndef STRATUM_VERBOSE_LOG
 #define STRATUM_VERBOSE_LOG 0
 #endif
@@ -100,8 +103,122 @@ static bool parse_mining_subscribe_doc(const StaticJsonDocument<BUFFER_JSON_DOC>
 }
 
 
+// STEP 0: Negotiate protocol extensions (version-rolling / BIP 310, aka ASICBoost)
+    // Docs:
+    // - https://github.com/slushpool/stratumprotocol/blob/master/stratum-extensions.mediawiki
+    // Sent before mining.subscribe. Many solo pools don't implement this method at all,
+    // so failure/timeout here is non-fatal: we just continue without version-rolling.
+static bool parse_mining_configure_doc(const StaticJsonDocument<BUFFER_JSON_DOC> &doc, mining_subscribe& mSubscribe)
+{
+    if (!doc.containsKey("result"))
+      return false;
+    if (doc["result"].isNull())
+      return false;
+
+    bool granted = doc["result"]["version-rolling"] | false;
+    if (!granted)
+      return false;
+
+    const char *mask_hex = doc["result"]["version-rolling.mask"] | "1fffe000";
+    mSubscribe.version_mask = (uint32_t)strtoul(mask_hex, nullptr, 16);
+    mSubscribe.version_rolling = true;
+    return true;
+}
+
+bool tx_mining_configure(WiFiClient& client, mining_subscribe& mSubscribe)
+{
+    mSubscribe.version_rolling = false;
+    mSubscribe.version_mask = 0;
+
+    char payload[BUFFER] = {0};
+    static char line_buffer[BUFFER_JSON_DOC + 256];
+    size_t line_len = 0;
+    bool line_overflow = false;
+
+    id = 1; //Configure precedes subscribe in the id sequence
+    snprintf(payload, sizeof(payload),
+      "{\"id\": %u, \"method\": \"mining.configure\", \"params\": [[\"version-rolling\"], "
+      "{\"version-rolling.mask\": \"1fffe000\", \"version-rolling.min-bit-count\": 2}]}\n", id);
+
+    Serial.println("[WORKER] ==> Mining configure (version-rolling)");
+    Serial.print("  Sending  : "); Serial.println(payload);
+    if (!client.print(payload))
+      return true; //Non-fatal: just proceed without version-rolling
+
+    uint32_t started = millis();
+    bool definitive = false;
+    while ((uint32_t)(millis() - started) < STRATUM_CONFIGURE_TIMEOUT_MS)
+    {
+      if (!client.connected())
+        break;
+
+      if (!client.available())
+      {
+        vTaskDelay(STRATUM_SUBSCRIBE_POLL_MS / portTICK_PERIOD_MS);
+        continue;
+      }
+
+      while (client.available())
+      {
+        int ch = client.read();
+        if (ch < 0)
+          break;
+        if (ch == '\r')
+          continue;
+        if (ch != '\n')
+        {
+          if (line_overflow)
+            continue;
+          if (line_len + 1 < sizeof(line_buffer))
+            line_buffer[line_len++] = (char)ch;
+          else
+            line_overflow = true;
+          continue;
+        }
+
+        if (line_overflow)
+        {
+          line_overflow = false;
+          line_len = 0;
+          continue;
+        }
+        if (!lineHasContent(line_buffer, line_len))
+        {
+          line_len = 0;
+          continue;
+        }
+
+        doc.clear();
+        DeserializationError error = deserializeJson(doc, line_buffer, line_len);
+        line_len = 0;
+        if (error)
+          continue;
+
+        // A response to our configure request has no "method" key. Anything else
+        // (e.g. a notification) isn't ours to consume here; well-behaved pools don't
+        // send notifications before subscribe/authorize anyway.
+        if (!doc.containsKey("method"))
+        {
+          parse_mining_configure_doc(doc, mSubscribe);
+          definitive = true;
+          break;
+        }
+      }
+      if (definitive)
+        break;
+    }
+
+    if (mSubscribe.version_rolling)
+      Serial.printf("[WORKER] Version-rolling enabled, mask=0x%08lX\n", (unsigned long)mSubscribe.version_mask);
+    else
+      Serial.println("[WORKER] Pool has no version-rolling support (or didn't answer) - continuing without it");
+
+    doc.clear();
+    return true; //Never block the connection sequence because of this
+}
+
 // STEP 1: Pool server connection (SUBSCRIBE)
-    // Docs: 
+    // Docs:
     // - https://cs.braiins.com/stratum-v1/docs
     // - https://github.com/aeternity/protocol/blob/master/STRATUM.md#mining-subscribe
 bool tx_mining_subscribe(WiFiClient& client, mining_subscribe& mSubscribe, const char *resume_id)
@@ -344,7 +461,7 @@ bool parse_mining_notify_doc(StaticJsonDocument<BUFFER_JSON_DOC>& doc, mining_jo
 }
 
 
-bool tx_mining_submit(WiFiClient& client, const mining_subscribe& mWorker, const mining_job& mJob, unsigned long nonce, unsigned long &submit_id)
+bool tx_mining_submit(WiFiClient& client, const mining_subscribe& mWorker, const mining_job& mJob, unsigned long nonce, unsigned long &submit_id, uint32_t version_bits)
 {
     char payload[BUFFER] = {0};
     char nonce_hex[9] = {0};
@@ -353,14 +470,31 @@ bool tx_mining_submit(WiFiClient& client, const mining_subscribe& mWorker, const
     // Submit
     id = getNextId(id);
     submit_id = id;
-    sprintf(payload, "{\"id\":%u,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}\n",
-        id,
-        mWorker.wName,//"bc1qvv469gmw4zz6qa4u4dsezvrlmqcqszwyfzhgwj", //mWorker.name,
-        mJob.job_id,
-        mWorker.extranonce2,
-        mJob.ntime,
-        nonce_hex
-        );
+    if (mWorker.version_rolling)
+    {
+      char version_bits_hex[9] = {0};
+      snprintf(version_bits_hex, sizeof(version_bits_hex), "%08lx", (unsigned long)version_bits);
+      sprintf(payload, "{\"id\":%u,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}\n",
+          id,
+          mWorker.wName,
+          mJob.job_id,
+          mWorker.extranonce2,
+          mJob.ntime,
+          nonce_hex,
+          version_bits_hex
+          );
+    }
+    else
+    {
+      sprintf(payload, "{\"id\":%u,\"method\":\"mining.submit\",\"params\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}\n",
+          id,
+          mWorker.wName,//"bc1qvv469gmw4zz6qa4u4dsezvrlmqcqszwyfzhgwj", //mWorker.name,
+          mJob.job_id,
+          mWorker.extranonce2,
+          mJob.ntime,
+          nonce_hex
+          );
+    }
     #if STRATUM_VERBOSE_LOG
     Serial.print("  Sending  : "); Serial.print(payload);
     #endif
