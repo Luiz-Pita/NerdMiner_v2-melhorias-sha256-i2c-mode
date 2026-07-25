@@ -46,6 +46,15 @@
 #ifndef MONITOR_TASK_PRIORITY
 #define MONITOR_TASK_PRIORITY 5
 #endif
+#ifndef LOOP_TASK_PRIORITY
+#define LOOP_TASK_PRIORITY 2
+#endif
+#ifndef LOOP_WIFI_PROCESS_CONNECTED_MS
+#define LOOP_WIFI_PROCESS_CONNECTED_MS 1000
+#endif
+#ifndef LOOP_WIFI_PROCESS_DISCONNECTED_MS
+#define LOOP_WIFI_PROCESS_DISCONNECTED_MS 100
+#endif
 
 #ifdef PIN_BUTTON_1
   OneButton button1(PIN_BUTTON_1);
@@ -751,7 +760,7 @@ void setup()
   esp_task_wdt_add(minerTask2);
 #endif
 
-  vTaskPrioritySet(NULL, 4);
+  vTaskPrioritySet(NULL, LOOP_TASK_PRIORITY);
 
   /******** MONITOR SETUP *****/
   #if !defined(I2C_HASH_SLAVE)
@@ -780,11 +789,19 @@ void loop() {
     button2.tick();
   #endif
 
-#ifdef TOUCH_ENABLE
+  #ifdef TOUCH_ENABLE
   touchHandler.isTouched();
 #endif
   #if !defined(I2C_HASH_SLAVE)
-  wifiManagerProcess(); // avoid delays() in loop when non-blocking and other long running code
+  static uint32_t last_wm_process_ms = 0;
+  const uint32_t now = millis();
+  const bool wifi_connected = (WiFi.status() == WL_CONNECTED);
+  const uint32_t wm_period_ms = wifi_connected ? LOOP_WIFI_PROCESS_CONNECTED_MS : LOOP_WIFI_PROCESS_DISCONNECTED_MS;
+  if (last_wm_process_ms == 0 || (uint32_t)(now - last_wm_process_ms) >= wm_period_ms)
+  {
+    wifiManagerProcess(); // avoid delays() in loop when non-blocking and other long running code
+    last_wm_process_ms = now;
+  }
   #endif
 
   vTaskDelay(50 / portTICK_PERIOD_MS);
